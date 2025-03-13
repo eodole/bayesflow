@@ -4,7 +4,7 @@ author: "Leona Odole"
 date: "2025-03-02"
 output: html_document
 ---
-
+# Set Up 
 ```{r}
 library(reticulate)
 ```
@@ -36,7 +36,8 @@ if(!("KERAS_BACKEND" %in% names(system.environment))){
 
 Users will notice that bayesflows uses a lot of dictionaries 
 
-# create the likelihood model following linear regrssion 
+# Generative Model
+create the likelihood model following linear regrssion 
 ```{r}
 
 likelihood <- function(beta_0, beta_1, sigma, N, ...){
@@ -74,9 +75,28 @@ simulator = bf$simulators$make_simulator(c(prior,likelihood), meta_fn = meta)
 ```
 
 ```{r}
-simulator$sample(10L) # note this must be an integer specify with L 
+sim_draws = simulator$sample(10L) # note this must be an integer specify with L 
 # 10 L is the batch size 
 ```
 
 
-##
+the plot functions dont work 
+
+# Adapter 
+
+adapter lets us apply transforms to our data before training, for each of these steps we can use add transform and a string name of the tr
+
+```{r}
+
+adapter <- bf$adapters$Adapter()$broadcast("N", to="x")$as_set(c("x", "y"))$constrain("sigma", lower=0)$standardize(exclude=c("N"))$concatenate(c("beta_0", "beta_1", "sigma"), into="inference_variables")$concatenate(c("x", "y"), into="summary_variables")$rename("N", "inference_conditions")
+
+
+```
+
+
+
+```{r}
+adapter(np_array(sim_draws))
+
+```
+
