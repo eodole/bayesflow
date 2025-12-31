@@ -4,7 +4,10 @@ from bayesflow.types import Shape, Tensor
 from bayesflow.utils.serialization import serializable
 
 from bayesflow.networks.inference_network import InferenceNetwork
+# from bayesflow.networks.coupling_flow import CouplingFlow
+
 from bayesflow.networks.coupling_flow import CouplingFlow
+# from bayesflow.networks.coupling_flow import DualCoupling
 
 from .conditional_gaussian import ConditionalGaussian
 
@@ -23,7 +26,9 @@ class CIF(InferenceNetwork):
     arXiv:1909.13833.
     """
 
-    def __init__(self, pq_depth: int = 4, pq_width: int = 128, pq_activation: str = "swish", **kwargs):
+    def __init__(
+        self, pq_depth: int = 4, pq_width: int = 128, pq_activation: str = "swish", layers_L: int = 3, **kwargs
+    ):
         """Creates an instance of a `CIF` with configurable
         `ConditionalGaussian` distributions p and q, each containing MLP
         networks
@@ -36,18 +41,36 @@ class CIF(InferenceNetwork):
             The dimensionality of the MLP hidden layers
         pq_activation: str, optional, default: 'tanh'
             The MLP activation function
+        layers_L: int, number of layers in CIF
         """
 
         super().__init__(base_distribution="normal", **kwargs)
-        self.bijection = CouplingFlow()
-        self.p_dist = ConditionalGaussian(depth=pq_depth, width=pq_width, activation=pq_activation)
-        self.q_dist = ConditionalGaussian(depth=pq_depth, width=pq_width, activation=pq_activation)
+        # self.bijection = CouplingFlow()
+        # these are basically the neural net that we are learning params from, this implementation uses
+        # a conditional gaussian.. how does this relate to the paper?
+        # both p and q have a nn representing the means and standard dev.
+        # self.base_dist = ConditionalGaussian(depth=pq_depth, width=pq_width, activation=pq_activation)
+        self.p_dists = []
+        self.q_dists = []
+        self.layers = []
+        self.layers_L = layers_L
+
+        for i in range(layers_L):
+            p_dist = ConditionalGaussian(depth=pq_depth, width=pq_width, activation=pq_activation)
+            q_dist = ConditionalGaussian(depth=pq_depth, width=pq_width, activation=pq_activation)
+            bijection = CouplingFlow()
+
+            self.p_dists.append(p_dist)
+            self.q_dists.append(q_dist)
+            self.layers.append(bijection)
 
     def build(self, xz_shape: Shape, conditions_shape: Shape = None) -> None:
+        for i in range(self.layers_L):
+            self.p_dists[i].build(xz_shape)
+            self.q_dists[i].build(xz_shape)
+            self.layers[i].build(xz_shape, conditions_shape=conditions_shape)
+
         super().build(xz_shape)
-        self.bijection.build(xz_shape, conditions_shape=conditions_shape)
-        self.p_dist.build(xz_shape)
-        self.q_dist.build(xz_shape)
 
     def call(
         self, xz: Tensor, conditions: Tensor = None, inverse: bool = False, **kwargs
@@ -56,50 +79,83 @@ class CIF(InferenceNetwork):
             return self._inverse(xz, conditions=conditions, **kwargs)
         return self._forward(xz, conditions=conditions, **kwargs)
 
-    def _forward(
+    def _forward(  # distribution direction
         self, x: Tensor, conditions: Tensor = None, density: bool = False, **kwargs
     ) -> Tensor | tuple[Tensor, Tensor]:
-        # Sample u ~ q_u
-        u, log_qu = self.q_dist.sample(x, log_prob=True)
+        z = x
+        elbo = 0.0
+        for layer_idx in reversed(range(self.layers_L)):
+            layer = self.layers[layer_idx]
+            q_dist = self.q_dists[layer_idx]
+            p_dist = self.p_dists[layer_idx]
 
-        # Bijection and log Jacobian x -> z
-        z, log_jac = self.bijection(x, conditions=conditions, density=True)
-        if log_jac.ndim > 1:
-            log_jac = keras.ops.sum(log_jac, axis=1)
+            # Sample u ~ q(u | z_l) where z_l is current z
+            u, log_qu = q_dist.sample(z, log_prob=True)
 
-        # Log prob over p on u with conditions z
-        log_pu = self.p_dist.log_prob(u, z)
+            # Bijection and log Jacobian x -> z
+            # z_{l-1} = F^{-1}(z_l;u) and log Jac
+
+            z_prev, log_jac = layer(z, conditions=keras.ops.concatenate([conditions, u], axis=-1), density=True)
+            if log_jac.ndim > 1:
+                log_jac = keras.ops.sum(log_jac, axis=1)
+
+            # Log prob over p on u with conditions z
+            # log p(u | z_{l-1})
+            log_pu = p_dist.log_prob(u, z_prev)
+
+            # we cannot compute an exact analytical density
+            # Update ELBO: += log p(u|z_{l-1}) - log q(u|z_l) + log|det J|
+            elbo = log_pu - log_qu + log_jac  # +
+
+            # Update Z
+            z = z_prev
 
         # Prior log prob
         log_prior = self.base_distribution.log_prob(z)
         if log_prior.ndim > 1:
             log_prior = keras.ops.sum(log_prior, axis=1)
 
-        # we cannot compute an exact analytical density
-        elbo = log_jac + log_pu + log_prior - log_qu
+        elbo = elbo + log_prior
 
         if density:
             return z, elbo
 
         return z
 
-    def _inverse(
+    def _inverse(  # sampling direction
         self, z: Tensor, conditions: Tensor = None, density: bool = False, **kwargs
     ) -> Tensor | tuple[Tensor, Tensor]:
+        # compute bijection z -> x
+
+        x = z
+        log_prob_sum = 0.0
+
+        for layer_index in range(len(self.layers)):
+            layer = self.layers[layer_index]
+            p_dist = self.p_dists[layer_index]
+
+            # sample u ~ p(u | z_{l-1})
+            u = p_dist.sample(x)
+
+            # compute x_l = F(x_{l-1};u)
+            x, log_jac = layer(x, conditions=keras.ops.concatenate([conditions, u], axis=-1), inverse=True)
+            log_pu = p_dist.log_prob(u, x)
+            log_prob_sum = log_prob_sum + log_pu + log_jac
+
         if not density:
-            return self.bijection(z, conditions=conditions, inverse=True, density=False)
+            return x
 
-        u = self.p_dist.sample(z)
-        x = self.bijection(z, conditions=conditions, inverse=True)
+        return x, log_prob_sum
 
-        log_pu = self.p_dist.log_prob(u, x)
-
-        return x, log_pu
+    # def F(self, z,u):
+    #     s = self.s_net
+    #     t = self.t_net
+    #     return self.bijection(keras.layers.Multiply()[keras.ops.exp(-s(u)), z - t(u)])
 
     def compute_metrics(self, x: Tensor, conditions: Tensor = None, stage: str = "training") -> dict[str, Tensor]:
         base_metrics = super().compute_metrics(x, conditions=conditions, stage=stage)
 
-        elbo = self.log_prob(x, conditions=conditions, training=stage == "training")
+        elbo = self.log_prob(x, conditions=conditions)
 
         loss = -keras.ops.mean(elbo)
 
