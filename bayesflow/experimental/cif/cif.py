@@ -68,9 +68,18 @@ class CIF(InferenceNetwork):
         for i in range(self.layers_L):
             self.p_dists[i].build(xz_shape)
             self.q_dists[i].build(xz_shape)
-            self.layers[i].build(xz_shape, conditions_shape=conditions_shape)
+            if conditions_shape is not None:
+                combined_conditions_shape = list(conditions_shape)
+                combined_conditions_shape[-1] = conditions_shape[-1] + xz_shape[-1]
+                combined_conditions_shape = tuple(combined_conditions_shape)
+            else:
+                combined_conditions_shape = xz_shape
 
-        super().build(xz_shape)
+            self.layers[i].build(xz_shape, conditions_shape=combined_conditions_shape)
+
+        # super().build(xz_shape)
+        self.base_distribution.build(xz_shape)
+        self.built = True
 
     def call(
         self, xz: Tensor, conditions: Tensor = None, inverse: bool = False, **kwargs
@@ -92,10 +101,13 @@ class CIF(InferenceNetwork):
             # Sample u ~ q(u | z_l) where z_l is current z
             u, log_qu = q_dist.sample(z, log_prob=True)
 
+            if conditions is not None:
+                layer_conditions = keras.ops.concatenate([conditions, u], axis=-1)
+            else:
+                layer_conditions = u
             # Bijection and log Jacobian x -> z
             # z_{l-1} = F^{-1}(z_l;u) and log Jac
-
-            z_prev, log_jac = layer(z, conditions=keras.ops.concatenate([conditions, u], axis=-1), density=True)
+            z_prev, log_jac = layer(z, conditions=layer_conditions, density=True)
             if log_jac.ndim > 1:
                 log_jac = keras.ops.sum(log_jac, axis=1)
 
@@ -137,10 +149,18 @@ class CIF(InferenceNetwork):
             # sample u ~ p(u | z_{l-1})
             u = p_dist.sample(x)
 
+            if conditions is not None:
+                layer_conditions = keras.ops.concatenate([conditions, u], axis=-1)
+            else:
+                layer_conditions = u
+
             # compute x_l = F(x_{l-1};u)
-            x, log_jac = layer(x, conditions=keras.ops.concatenate([conditions, u], axis=-1), inverse=True)
-            log_pu = p_dist.log_prob(u, x)
-            log_prob_sum = log_prob_sum + log_pu + log_jac
+            if density:
+                x, log_jac = layer(x, conditions=layer_conditions, inverse=True, density=True)
+                log_pu = p_dist.log_prob(u, x)
+                log_prob_sum = log_prob_sum + log_pu + log_jac
+            else:
+                x = layer(x, conditions=layer_conditions, inverse=True, density=False)
 
         if not density:
             return x
@@ -152,8 +172,10 @@ class CIF(InferenceNetwork):
     #     t = self.t_net
     #     return self.bijection(keras.layers.Multiply()[keras.ops.exp(-s(u)), z - t(u)])
 
-    def compute_metrics(self, x: Tensor, conditions: Tensor = None, stage: str = "training") -> dict[str, Tensor]:
-        base_metrics = super().compute_metrics(x, conditions=conditions, stage=stage)
+    def compute_metrics(
+        self, x: Tensor, conditions: Tensor = None, sample_weight: Tensor = None, stage: str = "training"
+    ) -> dict[str, Tensor]:
+        base_metrics = super().compute_metrics(x, conditions=conditions, sample_weight=sample_weight, stage=stage)
 
         elbo = self.log_prob(x, conditions=conditions)
 

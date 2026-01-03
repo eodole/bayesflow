@@ -49,18 +49,18 @@ class ConditionalGaussian(keras.Layer):
     def _diagonal_gaussian_log_prob(self, conditions: Tensor, means: Tensor, stds: Tensor) -> Tensor:
         batch_size = keras.ops.shape(conditions)[0]
 
-        if keras.ops.shape(means)[0] != batch_size or keras.ops.shape(stds)[0] != batch_size:
-            raise ValueError("Means and stds must have the same batch size as conditions.")
+        # if keras.ops.shape(means)[0] != batch_size or keras.ops.shape(stds)[0] != batch_size:
+        #     raise ValueError("Means and stds must have the same batch size as conditions.")
 
         flat_conditions = keras.ops.reshape(conditions, (batch_size, -1))
         flat_means = keras.ops.reshape(means, (batch_size, -1))
         flat_stds = keras.ops.reshape(stds, (batch_size, -1))
 
-        flat_variances = flat_stds**2
+        flat_variances = flat_stds**2 + 1e-6
 
         dim = keras.ops.shape(flat_conditions)[1]
 
-        const_term = -0.5 * dim * np.log(2 * np.pi)
+        const_term = -0.5 * keras.ops.cast(dim, "float32") * np.log(2 * np.pi)
         log_det_terms = -0.5 * keras.ops.sum(keras.ops.log(flat_variances), axis=1)
         product_terms = -0.5 * keras.ops.sum((flat_conditions - flat_means) ** 2 / flat_variances, axis=1)
 
